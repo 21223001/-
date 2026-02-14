@@ -1,0 +1,177 @@
+================================================================================
+WUS 縦方向グラデーション追加 仕様書
+（ckoverride / CK-WUS オーバーライドへの適用を前提）
+================================================================================
+
+【概要】
+現在の TSV の WUS に対し、y 軸方向のグラデーションで加算量を決め、その値を WUS に加算する。
+
+【前提】
+- ckoverride（ckwus_override_editor.py）の TSV 入出力形式に準拠する。
+- 実装は ckoverride 側に組み込むか、同一仕様で別ツールとして実装する。
+
+--------------------------------------------------------------------------------
+入力
+--------------------------------------------------------------------------------
+- 入力は TSV のみ。dump は不要。
+- TSV には次の列が必須であること:
+    cell_id, ck, wus, cy
+  - cy: セルの y 座標。これを用いて 0～20 の段階を決める。
+  - cx は本機能では使用しないが、TSV に含まれていてもよい（例: cell_id, ck, wus, cx, cy）。
+
+--------------------------------------------------------------------------------
+段階の定義（n = 20）
+--------------------------------------------------------------------------------
+- 段階数 n = 20。すなわち 0, 1, 2, ..., 20 の 21 段階とする。
+- y 軸の正規化:
+  - TSV 内の全セルの cy の最大値 → 段階 0
+  - TSV 内の全セルの cy の最小値 → 段階 20
+  - その間は線形にマッピングする。
+- 各セルについて、その cy を上記で 0～20 の実数に変換し、
+  「最も近い整数段階」（0～20 のいずれか）を求める。
+
+--------------------------------------------------------------------------------
+グラデーション値と加算
+--------------------------------------------------------------------------------
+- 段階 0～20 のそれぞれに、加算量を表す実数（グラデーション値）を 1 つずつ用意する（計 21 個）。
+- 各セルでは:
+  1. 上記で求めた「最も近い段階」k（0 ≤ k ≤ 20）に対応するグラデーション値を取得する。
+  2. その値を小数点以下切り捨てた整数にする。
+  3. その整数を、現在の WUS に加算する。
+     （新 WUS = 元の WUS + floor(グラデーション値)）
+- グラデーション値の与え方:
+  - 実装時に決める（例: コマンドライン引数、設定ファイル、固定 1,2,...,21 など）。
+  - 21 個の実数を何らかの形で指定できるようにする。
+
+--------------------------------------------------------------------------------
+対象セル
+--------------------------------------------------------------------------------
+- 全セルを対象とする。ck の値による絞り込みは行わない。
+
+--------------------------------------------------------------------------------
+出力
+--------------------------------------------------------------------------------
+- 加算後の WUS を TSV として出力する。
+- 形式は ckoverride の TSV と同一（cell_id, ck, wus [ , cx, cy ]）とする。
+- 加算後の WUS のクリップ（0～1 または 0～100 など）は、ckoverride 側の既存方針に合わせる。
+
+--------------------------------------------------------------------------------
+備考
+--------------------------------------------------------------------------------
+- TSV に cy 列が無い場合はエラーとするか、仕様外として扱う。
+- 既存の add_ellipse_* 等と同様、allow_out_of_range 等のオプションを
+  実装に含めるかは ckoverride 統合時に判断する。
+
+================================================================================
+【具体的なスクリプト例】（Python 3）
+================================================================================
+以下をそのまま .py に保存して実行可能。入力 TSV に cy 列が必須。
+
+--------------------------------------------------------------------------------
+使い方
+--------------------------------------------------------------------------------
+  python wus_vertical_gradient.py input.tsv -o output.tsv
+  python wus_vertical_gradient.py input.tsv -o output.tsv -g "0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20"
+  -g 省略時は段階 0～20 に 0,1,2,...,20 を対応させる。
+
+--------------------------------------------------------------------------------
+スクリプト本体
+--------------------------------------------------------------------------------
+
+#!/usr/bin/env python3
+"""WUS 縦方向グラデーション追加。TSV の cy を 0～20 段階にマッピングし、
+   段階ごとの加算量（小数点以下切り捨て）を WUS に加算する。"""
+import argparse
+import csv
+import math
+import sys
+
+N_STAGES = 21   # 段階 0～20
+
+def main():
+    p = argparse.ArgumentParser(description="WUS vertical gradient add (TSV with cy required)")
+    p.add_argument("input_tsv", type=str, help="Input TSV (cell_id, ck, wus, cy [ , cx ])")
+    p.add_argument("-o", "--output", required=True, help="Output TSV path")
+    p.add_argument("-g", "--gradient", type=str, default=None,
+                   help="Comma-separated 21 floats for stages 0..20 (e.g. '0,1,2,...,20')")
+    args = p.parse_args()
+
+    # グラデーション値 21 個
+    if args.gradient is not None:
+        grad = [float(x.strip()) for x in args.gradient.split(",")]
+        if len(grad) != N_STAGES:
+            print(f"Error: --gradient must have exactly {N_STAGES} values, got {len(grad)}", file=sys.stderr)
+            sys.exit(1)
+    else:
+        grad = [float(k) for k in range(N_STAGES)]  # 0, 1, ..., 20
+
+    rows, header = [], None
+    with open(args.input_tsv, "r", encoding="utf-8") as f:
+        r = csv.reader(f, delimiter="\t")
+        header = next(r)
+        col_cell_id = col_ck = col_wus = col_cy = col_cx = None
+        for i, name in enumerate(header):
+            n = name.strip().lower()
+            if n == "cell_id": col_cell_id = i
+            elif n == "ck":    col_ck = i
+            elif n == "wus":   col_wus = i
+            elif n == "cy":    col_cy = i
+            elif n == "cx":    col_cx = i
+        if col_cell_id is None or col_ck is None or col_wus is None or col_cy is None:
+            print("Error: TSV must have columns cell_id, ck, wus, cy", file=sys.stderr)
+            sys.exit(1)
+        for row in r:
+            if not row or all(c.strip() == "" for c in row):
+                continue
+            rows.append(row)
+
+    if not rows:
+        print("Error: no data rows", file=sys.stderr)
+        sys.exit(1)
+
+    # cy を float にし、y_min, y_max を取得
+    cy_vals = []
+    for row in rows:
+        try:
+            cy_vals.append(float(row[col_cy]))
+        except (ValueError, IndexError):
+            print("Error: invalid cy in row", row[:5], file=sys.stderr)
+            sys.exit(1)
+    y_min, y_max = min(cy_vals), max(cy_vals)
+    y_span = y_max - y_min
+    if y_span <= 0:
+        y_span = 1.0  # 1点のみのときは全員段階 0
+
+    # 各セル: cy → 0..20 の実数 → 最も近い整数段階 → floor(グラデーション値) を WUS に加算
+    for row in rows:
+        cy = float(row[col_cy])
+        # y_max → 0, y_min → 20 なので: t = (y_max - cy) / y_span * 20
+        t = (y_max - cy) / y_span * (N_STAGES - 1)
+        stage = int(round(t))
+        stage = max(0, min(N_STAGES - 1, stage))
+        add_val = math.floor(grad[stage])
+        try:
+            wus_old = float(row[col_wus])
+        except (ValueError, IndexError):
+            continue
+        wus_new = wus_old + add_val
+        row[col_wus] = str(wus_new)
+
+    with open(args.output, "w", encoding="utf-8", newline="") as f:
+        w = csv.writer(f, delimiter="\t")
+        w.writerow(header)
+        w.writerows(rows)
+    print(f"Written: {args.output} (WUS += floor(gradient) by stage 0..20)")
+
+if __name__ == "__main__":
+    main()
+
+--------------------------------------------------------------------------------
+補足
+--------------------------------------------------------------------------------
+- 入力 TSV の列順は cell_id, ck, wus の後に cx, cy があっても cy のみ必須。
+- 出力は入力と同じヘッダー・列順で、wus 列のみ加算後の値に変わる。
+- クリップ（0～1 など）は行っていない。必要なら ckoverride 側で行うか、
+  本スクリプトの wus_new を max(0, min(1, wus_new)) などでクリップしてよい。
+
+================================================================================
